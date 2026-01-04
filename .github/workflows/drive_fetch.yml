@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       out_name:
-        description: "Optional output name (for m3u8 лучше .mp4)"
+        description: "Optional output name (for .m3u8 лучше .mp4). Example: episode4.mp4"
         required: false
         type: string
 
@@ -28,26 +28,57 @@ jobs:
 
       - name: Install system deps (ffmpeg)
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Install Python deps
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install google-api-python-client google-auth google-auth-httplib2 httplib2
 
       - name: Download / Build output
+        id: dl
         env:
           URL: ${{ inputs.url }}
           OUT_NAME: ${{ inputs.out_name }}
         run: |
           set -e
-          python tools/fetch.py "$URL" "$OUT_NAME"
+
+          FILE="${OUT_NAME}"
+
+          # If user didn't pass out_name: choose safe defaults
+          if [ -z "$FILE" ]; then
+            if echo "$URL" | grep -qiE '\.m3u8($|\?)'; then
+              FILE="output.mp4"
+            else
+              FILE="output.bin"
+            fi
+          fi
+
+          echo "Will save as: $FILE"
+          python tools/fetch.py "$URL" "$FILE"
+
+          # expose for next steps
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
       - name: Upload to Google Drive
         env:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          FILE: ${{ steps.dl.outputs.file }}
         run: |
           set -e
-          python tools/upload_drive.py output.bin
+          echo "Uploading: $FILE"
+          python tools/upload_drive.py "$FILE"
+
+      # Optional: also keep a copy as GitHub Actions artifact (useful for debugging)
+      - name: Upload artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetched-file
+          path: |
+            ${{ steps.dl.outputs.file }}
+          if-no-files-found: ignore
