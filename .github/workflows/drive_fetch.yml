@@ -1,4 +1,4 @@
-name: Fetch URL (file/HLS) -> Google Drive
+name: Fetch URL (file/HLS) -> Google Drive (OAuth)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,15 @@ on:
         required: true
         type: string
       out_name:
-        description: "Optional output name (for .m3u8 лучше .mp4). Example: episode4.mp4"
+        description: "Optional output filename (e.g. video.mp4). If empty: auto"
+        required: false
+        type: string
+      user_agent:
+        description: "Optional User-Agent (some hosts require). Leave empty for default"
+        required: false
+        type: string
+      referer:
+        description: "Optional Referer header (some hosts require). Leave empty for default"
         required: false
         type: string
 
@@ -28,57 +36,172 @@ jobs:
 
       - name: Install system deps (ffmpeg)
         run: |
-          set -e
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
       - name: Install Python deps
         run: |
-          set -e
           python -m pip install --upgrade pip
-          pip install google-api-python-client google-auth google-auth-httplib2 httplib2
+          pip install google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 requests
+
+      - name: Prepare OAuth files
+        env:
+          TOKEN_B64: ${{ secrets.GDRIVE_TOKEN_JSON_B64 }}
+          CREDS_B64: ${{ secrets.GDRIVE_CREDENTIALS_JSON_B64 }}
+        run: |
+          set -e
+          if [ -z "$TOKEN_B64" ] || [ -z "$CREDS_B64" ]; then
+            echo "Missing secrets: GDRIVE_TOKEN_JSON_B64 or GDRIVE_CREDENTIALS_JSON_B64"
+            exit 1
+          fi
+          echo "$TOKEN_B64" | base64 -d > token.json
+          echo "$CREDS_B64" | base64 -d > credentials.json
+          ls -la
 
       - name: Download / Build output
-        id: dl
         env:
           URL: ${{ inputs.url }}
           OUT_NAME: ${{ inputs.out_name }}
+          USER_AGENT: ${{ inputs.user_agent }}
+          REFERER: ${{ inputs.referer }}
         run: |
           set -e
 
-          FILE="${OUT_NAME}"
+          python - << 'PY'
+          import os, re, subprocess, sys
+          import requests
+          from urllib.parse import urlparse
 
-          # If user didn't pass out_name: choose safe defaults
-          if [ -z "$FILE" ]; then
-            if echo "$URL" | grep -qiE '\.m3u8($|\?)'; then
-              FILE="output.mp4"
-            else
-              FILE="output.bin"
-            fi
-          fi
+          url = os.environ.get("URL","").strip()
+          out_name = (os.environ.get("OUT_NAME") or "").strip()
+          ua = (os.environ.get("USER_AGENT") or "").strip()
+          ref = (os.environ.get("REFERER") or "").strip()
 
-          echo "Will save as: $FILE"
-          python tools/fetch.py "$URL" "$FILE"
+          if not url:
+            print("URL is empty", file=sys.stderr)
+            sys.exit(1)
 
-          # expose for next steps
-          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          is_m3u8 = ".m3u8" in url.lower()
 
-      - name: Upload to Google Drive
+          # Decide output filename
+          def safe_name(s: str) -> str:
+            s = re.sub(r"[^\w\-. ]+", "_", s, flags=re.UNICODE).strip()
+            return s or "output"
+
+          if out_name:
+            out = safe_name(out_name)
+          else:
+            if is_m3u8:
+              out = "output.mp4"
+            else:
+              path = urlparse(url).path
+              base = os.path.basename(path) or "output.bin"
+              out = safe_name(base)
+
+          print(f"URL: {url}")
+          print(f"is_m3u8: {is_m3u8}")
+          print(f"Will save as: {out}")
+
+          headers = {}
+          if ua:
+            headers["User-Agent"] = ua
+          if ref:
+            headers["Referer"] = ref
+
+          if is_m3u8:
+            # Use ffmpeg to mux HLS to mp4 if accessible
+            # IMPORTANT: This is NOT a bypass. If server requires auth/DRM -> it will fail.
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+            for k,v in headers.items():
+              cmd += ["-headers", f"{k}: {v}\r\n"]
+            cmd += ["-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", out]
+            print("Running:", " ".join(cmd))
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+              print("ffmpeg failed", file=sys.stderr)
+              sys.exit(r.returncode)
+          else:
+            # Stream download
+            with requests.get(url, headers=headers, stream=True, timeout=60) as resp:
+              resp.raise_for_status()
+              with open(out, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024*1024):
+                  if chunk:
+                    f.write(chunk)
+
+          print("Done. Size:", os.path.getsize(out), "bytes")
+          PY
+
+      - name: Upload to Google Drive (OAuth)
         env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          FILE: ${{ steps.dl.outputs.file }}
         run: |
           set -e
-          echo "Uploading: $FILE"
-          python tools/upload_drive.py "$FILE"
 
-      # Optional: also keep a copy as GitHub Actions artifact (useful for debugging)
+          python - << 'PY'
+          import os, sys, glob, mimetypes
+          from google.oauth2.credentials import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          folder_id = (os.environ.get("GDRIVE_FOLDER_ID") or "").strip()
+          if not folder_id:
+            print("Missing secret: GDRIVE_FOLDER_ID", file=sys.stderr)
+            sys.exit(1)
+
+          # Find downloaded file (exclude json + repo files)
+          candidates = []
+          for f in glob.glob("*"):
+            if os.path.isdir(f): 
+              continue
+            if f in ("token.json", "credentials.json", "requirements.txt", "main.py", ".dockerignore"):
+              continue
+            if f.endswith(".yml") or f.endswith(".yaml"):
+              continue
+            candidates.append(f)
+
+          if not candidates:
+            print("No output file found to upload", file=sys.stderr)
+            sys.exit(1)
+
+          # Pick the largest (usually the video)
+          candidates.sort(key=lambda x: os.path.getsize(x), reverse=True)
+          filepath = candidates[0]
+          filename = os.path.basename(filepath)
+
+          print("Uploading:", filename, "size:", os.path.getsize(filepath))
+
+          creds = Credentials.from_authorized_user_file("token.json", scopes=["https://www.googleapis.com/auth/drive.file"])
+          service = build("drive", "v3", credentials=creds)
+
+          mime, _ = mimetypes.guess_type(filename)
+          mime = mime or "application/octet-stream"
+
+          file_metadata = {"name": filename, "parents": [folder_id]}
+          media = MediaFileUpload(filepath, mimetype=mime, resumable=True)
+
+          created = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name, webViewLink"
+          ).execute()
+
+          print("Uploaded:", created.get("name"))
+          print("File ID:", created.get("id"))
+          print("Link:", created.get("webViewLink"))
+          PY
+
       - name: Upload artifact (optional)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fetched-file
+          name: downloaded-output
           path: |
-            ${{ steps.dl.outputs.file }}
+            *.mp4
+            *.mkv
+            *.webm
+            *.bin
+            *.mp3
+            *.m4a
+            *.wav
+            *.zip
           if-no-files-found: ignore
