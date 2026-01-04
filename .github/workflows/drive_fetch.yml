@@ -1,0 +1,53 @@
+name: Fetch URL (file/HLS) -> Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Direct file URL or .m3u8 URL"
+        required: true
+        type: string
+      out_name:
+        description: "Optional output name (for m3u8 лучше .mp4)"
+        required: false
+        type: string
+
+jobs:
+  fetch_and_upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps (ffmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth google-auth-httplib2 httplib2
+
+      - name: Download / Build output
+        env:
+          URL: ${{ inputs.url }}
+          OUT_NAME: ${{ inputs.out_name }}
+        run: |
+          set -e
+          python tools/fetch.py "$URL" "$OUT_NAME"
+
+      - name: Upload to Google Drive
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          set -e
+          python tools/upload_drive.py output.bin
